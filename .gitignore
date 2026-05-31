@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+# Generated Loki theme image assets (created by tools/generate_loki_cyberpunk_themes.py)
+payloads/offensive/loki_themes/*/images/

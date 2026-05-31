@@ -1,0 +1,6 @@
+[submodule "vendor/loki"]
+	path = vendor/loki
+	url = https://github.com/brainphreak/loki-recon.git
+[submodule "vendor/jam-fi"]
+	path = vendor/jam-fi
+	url = https://github.com/ekomsSavior/Jam_fi
