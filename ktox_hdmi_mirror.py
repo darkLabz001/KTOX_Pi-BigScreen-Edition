@@ -119,6 +119,12 @@ SPLASH_DRED  = (130, 8, 12)
 SPLASH_WHITE = (240, 240, 255)
 SPLASH_CYAN  = (45, 226, 255)
 
+# ── UI click sounds ──────────────────────────────────────────────────────────
+# Runner writes /dev/shm/ktox_btn_evt with a 1-byte type code each time a
+# button registers; mirror plays the matching click sound. Type codes:
+#   n=navigation  c=confirm  b=back  h=home  x=stop/exit
+BTN_EVT_PATH = os.environ.get("KTOX_BTN_EVT_PATH", "/dev/shm/ktox_btn_evt")
+
 
 # ── Live system info ─────────────────────────────────────────────────────────
 class SysInfo:
@@ -128,8 +134,11 @@ class SysInfo:
     __slots__ = ("ip", "ssid", "temp_c", "uptime_min", "rx_kbps",
                  "wifi_dbm", "throttled", "rx_history",
                  "cpu_load", "n_cores", "active_payload",
+                 "hostname", "ssh_sessions",
+                 "loot_pcap", "loot_files", "_loot_pcap_prev",
                  "_rx_bytes", "_rx_t", "_last_refresh",
-                 "_prev_ssid", "_prev_ip", "_prev_payload")
+                 "_prev_ssid", "_prev_ip", "_prev_payload",
+                 "_ssid_down_since", "_last_known_ssid")
 
     # Bit meanings of vcgencmd get_throttled (Raspberry Pi); we flag any of
     # the live-now bits, not the "occurred since boot" bits.
@@ -155,6 +164,18 @@ class SysInfo:
         except Exception:
             self.n_cores = 4
         self.active_payload = None # name of currently-running payload or None
+        # Lightweight identity + remote-session widgets
+        try:
+            import socket
+            self.hostname = socket.gethostname()
+        except Exception:
+            self.hostname = "—"
+        self.ssh_sessions = 0
+        # Loot stats — recursive count of pcap/cap/handshake artifacts vs
+        # total files under ~/loot
+        self.loot_pcap = 0
+        self.loot_files = 0
+        self._loot_pcap_prev = 0
         self._rx_bytes = 0
         self._rx_t = time.time()
         self._last_refresh = 0.0
@@ -162,6 +183,9 @@ class SysInfo:
         self._prev_ssid = None
         self._prev_ip = None
         self._prev_payload = None
+        # WiFi auto-reconnect state
+        self._ssid_down_since = None    # float timestamp, or None when connected
+        self._last_known_ssid = None    # remembered for nmcli connection up
 
     def changes(self):
         """Yield (kind, text) tuples for state changes since last call.
@@ -312,9 +336,81 @@ class SysInfo:
         except Exception:
             self.active_payload = None
 
+        # SSH session count — established TCP connections on :22.
+        # /proc/net/tcp lists local + remote endpoints in hex; state 01 = ESTABLISHED.
+        try:
+            count = 0
+            with open("/proc/net/tcp") as f:
+                next(f)  # header
+                for line in f:
+                    parts = line.split()
+                    if len(parts) < 4:
+                        continue
+                    local = parts[1]              # AABBCCDD:PORT (hex)
+                    state = parts[3]
+                    if state != "01":
+                        continue
+                    try:
+                        port = int(local.split(":")[1], 16)
+                    except Exception:
+                        continue
+                    if port == 22:
+                        count += 1
+            self.ssh_sessions = count
+        except Exception:
+            pass
+
+        # Loot inventory — count handshake/capture artifacts and total files.
+        # ~/loot is the standard KTOX loot dir. Recursive but cheap (just
+        # os.scandir, no file reads).
+        try:
+            loot_root = os.path.expanduser("~kali/loot")
+            if not os.path.isdir(loot_root):
+                loot_root = os.path.expanduser("~/loot")
+            pcap = total = 0
+            for dirpath, _, files in os.walk(loot_root, followlinks=False):
+                for f in files:
+                    total += 1
+                    fl = f.lower()
+                    if (fl.endswith(".pcap") or fl.endswith(".pcapng")
+                            or fl.endswith(".cap") or fl.endswith(".hccapx")
+                            or fl.endswith(".22000") or "handshake" in fl
+                            or "pmkid" in fl):
+                        pcap += 1
+            self.loot_pcap = pcap
+            self.loot_files = total
+        except Exception:
+            pass
+
     def uptime_str(self) -> str:
         h, m = divmod(self.uptime_min, 60)
         return f"{h:d}h{m:02d}" if h else f"{m:d}m"
+
+    def maybe_reconnect_wifi(self, now: float):
+        """If WiFi has been disconnected for >20s and we know a previous
+        SSID, fire `nmcli connection up <ssid>` in the background. Returns
+        a toast string if it triggered a reconnect attempt, else None.
+        Requires NOPASSWD sudo for nmcli (already configured on the device)."""
+        if self.ssid not in ("—", ""):
+            self._last_known_ssid = self.ssid
+            self._ssid_down_since = None
+            return None
+        # Disconnected
+        if self._ssid_down_since is None:
+            self._ssid_down_since = now
+        elif (now - self._ssid_down_since) > 20.0 and self._last_known_ssid:
+            target = self._last_known_ssid
+            try:
+                subprocess.Popen(
+                    ["sudo", "-n", "nmcli", "connection", "up", target],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                pass
+            # Reset so we don't spam — give the next attempt ~30s window
+            self._ssid_down_since = now + 30.0
+            return f"Reconnect  {target[:10]}"
+        return None
 
 
 # ── Drawing ──────────────────────────────────────────────────────────────────
@@ -583,12 +679,18 @@ def draw_right_sidebar(surf, fonts, info: SysInfo, t, toasts):
     ssid_s = value_font.render(ssid_txt, True, ssid_col)
     surf.blit(ssid_s, (x0 + pad_x, y + p2fb_y(11)))
 
-    # ── IP ─────────────────────────────────────────────────────────────────
+    # ── IP + SSH count on one row ──────────────────────────────────────────
     y = p2fb_y(92)
     surf.blit(label_font.render("IP", True, DIM), (x0 + pad_x, y))
     ip_col = GREEN if info.ip != "—" else DIM
-    surf.blit(value_font.render(info.ip[:15], True, ip_col),
+    surf.blit(value_font.render(info.ip[:13], True, ip_col),
               (x0 + pad_x, y + p2fb_y(11)))
+    # SSH session indicator in top-right corner of this row
+    if info.ssh_sessions > 0:
+        ssh_txt = f"SSH {info.ssh_sessions}"
+        ssh_s = micro_font.render(ssh_txt, True, ACCENT_HOT)
+        surf.blit(ssh_s,
+                  (x0 + RIGHT_FB_W - pad_x - ssh_s.get_width(), y))
 
     # ── TEMP / UP on one row ───────────────────────────────────────────────
     y = p2fb_y(120)
@@ -630,11 +732,26 @@ def draw_right_sidebar(surf, fonts, info: SysInfo, t, toasts):
         frame_col=RULE,
     )
 
+    # ── Loot row (handshake count + total) ─────────────────────────────────
+    y = p2fb_y(196)
+    surf.blit(label_font.render("LOOT", True, DIM), (x0 + pad_x, y))
+    # Highlight pcap count green when there are captures
+    pcap_col = GREEN if info.loot_pcap > 0 else DIM
+    loot_txt = f"{info.loot_pcap}hsk/{info.loot_files}"
+    loot_s = micro_font.render(loot_txt, True, pcap_col)
+    surf.blit(loot_s,
+              (x0 + RIGHT_FB_W - pad_x - loot_s.get_width(), y))
+
+    # ── Hostname (small, bottom of stats block) ────────────────────────────
+    if info.hostname and info.hostname != "—":
+        hs = micro_font.render(info.hostname[:14].lower(), True, DIM)
+        surf.blit(hs, (x0 + pad_x, y + p2fb_y(10)))
+
     # ── Throttling warning (only when actively under-voltage / capped) ─────
     # Bits 0,1,2,3 are the live-now flags; bits 16+ are sticky "ever seen".
     live_throttle = info.throttled & 0xF
     if live_throttle:
-        y = p2fb_y(198)
+        y = p2fb_y(220)
         # Pulsing red warning bar
         warn_pulse = 0.5 + 0.5 * math.sin(t * 4.0)
         warn_col = (
@@ -692,6 +809,41 @@ def draw_right_sidebar(surf, fonts, info: SysInfo, t, toasts):
 
 
 # ── Boot splash drawing ──────────────────────────────────────────────────────
+# ── Button-click sound synthesis ─────────────────────────────────────────────
+# Pre-generated short bleeps for each button type. Cached at startup so we
+# don't allocate numpy arrays per click. Fall back to None if numpy/mixer
+# unavailable — the rest of the mirror keeps running silently.
+_CLICK_SOUNDS = {}
+
+
+def _make_click(freq_hz, ms, vol=0.25, square=False):
+    try:
+        import numpy as _np
+        if not pygame.mixer.get_init():
+            pygame.mixer.init(frequency=22050, size=-16, channels=1)
+        n = int(22050 * ms / 1000.0)
+        t = _np.arange(n) / 22050.0
+        if square:
+            wave = _np.where(_np.sin(2 * _np.pi * freq_hz * t) >= 0, 1.0, -1.0)
+        else:
+            wave = _np.sin(2 * _np.pi * freq_hz * t)
+        # Sharp attack, exponential decay — feels like a UI click
+        env = _np.exp(-t * (4000 / ms))
+        samples = (wave * env * vol * 32767).astype(_np.int16)
+        return pygame.mixer.Sound(buffer=samples.tobytes())
+    except Exception as e:
+        print(f"[clicks] init failed: {e}", file=sys.stderr)
+        return None
+
+
+def _init_click_sounds():
+    _CLICK_SOUNDS["n"] = _make_click(1400, 18, vol=0.20)        # nav  — short tick
+    _CLICK_SOUNDS["c"] = _make_click(900, 60, vol=0.30, square=True)  # confirm — chime
+    _CLICK_SOUNDS["b"] = _make_click(540, 28, vol=0.22)         # back  — low blip
+    _CLICK_SOUNDS["h"] = _make_click(700, 35, vol=0.22)         # home  — mid blip
+    _CLICK_SOUNDS["x"] = _make_click(380, 45, vol=0.30, square=True)  # exit  — buzz
+
+
 # ── Boot splash audio ───────────────────────────────────────────────────────
 def _splash_bleep(freq_hz=820, ms=160, vol=0.35):
     """Synthesise a short square-wave bleep and play it once. Lazy-imports
@@ -891,6 +1043,8 @@ def main() -> int:
     info = SysInfo()
     info.refresh(time.time(), force=True)
     toasts = ToastQueue()
+    _init_click_sounds()
+    last_btn_mtime = 0.0
 
     last_frame_mtime = 0.0
     cached_frame = None              # raw PIL/pygame image, as loaded
@@ -923,10 +1077,31 @@ def main() -> int:
             continue
 
         info.refresh(now)
+        # WiFi auto-reconnect — fires if SSID has been "—" for > 20s
+        reconnect_toast = info.maybe_reconnect_wifi(now)
+        if reconnect_toast:
+            toasts.push(reconnect_toast)
         # Auto-toast any state changes detected this refresh.
         for kind, text in info.changes():
             toasts.push(text)
         toasts.poll_file()
+
+        # Click sound — runner writes /dev/shm/ktox_btn_evt with a 1-byte
+        # type code on every accepted GPIO press. Cheap mtime poll.
+        try:
+            bt_mt = os.path.getmtime(BTN_EVT_PATH)
+            if bt_mt != last_btn_mtime:
+                last_btn_mtime = bt_mt
+                try:
+                    with open(BTN_EVT_PATH, "rb") as f:
+                        code = f.read(1).decode("ascii", "ignore") or "n"
+                except Exception:
+                    code = "n"
+                snd = _CLICK_SOUNDS.get(code) or _CLICK_SOUNDS.get("n")
+                if snd:
+                    snd.play()
+        except OSError:
+            pass
 
         # Reload KTOX content frame if it changed
         try:

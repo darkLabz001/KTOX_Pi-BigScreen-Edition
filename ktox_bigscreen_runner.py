@@ -313,6 +313,104 @@ ktox_device.PINS = {
     "KEY3_PIN":       4,   # SELECT = stop/exit
 }
 
+# ── 3d. L/R shoulder buttons → page up / page down ───────────────────────────
+# L=23, R=18 aren't in KTOX's PINS dict (it only knows the 8 SPI-HAT names)
+# so they'd be wasted. Run a small polling thread that, on press, enqueues
+# 6 synthetic UP/DOWN events directly into ktox_input's queue — so any list
+# menu scrolls a page at a time. Works because ktox_device.getButton checks
+# the virtual queue first and treats virtual presses identically to GPIO.
+import threading  # noqa: E402
+
+L_PIN, R_PIN = 23, 18
+PAGE_STEP = 6        # how many UP/DOWN events one L/R press generates
+LR_DEBOUNCE = 0.30   # seconds between accepted presses
+
+
+def _lr_pager_loop():
+    try:
+        import RPi.GPIO as GPIO
+        sys.path.insert(0, os.path.join(KTOX_DIR, "ktox_pi"))
+        import ktox_input
+    except Exception as e:
+        print(f"[lr-pager] disabled: {e}", file=sys.stderr)
+        return
+
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setwarnings(False)
+    GPIO.setup(L_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    GPIO.setup(R_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+
+    last_press = 0.0
+    prev_l = prev_r = 1
+    while True:
+        try:
+            now = time.time()
+            l_now = GPIO.input(L_PIN)
+            r_now = GPIO.input(R_PIN)
+            if l_now == 0 and prev_l == 1 and (now - last_press) > LR_DEBOUNCE:
+                last_press = now
+                for _ in range(PAGE_STEP):
+                    try:
+                        ktox_input._q.put_nowait("KEY_UP_PIN")
+                    except Exception:
+                        break
+            elif r_now == 0 and prev_r == 1 and (now - last_press) > LR_DEBOUNCE:
+                last_press = now
+                for _ in range(PAGE_STEP):
+                    try:
+                        ktox_input._q.put_nowait("KEY_DOWN_PIN")
+                    except Exception:
+                        break
+            prev_l, prev_r = l_now, r_now
+            time.sleep(0.02)
+        except Exception:
+            # Likely an exec_payload's GPIO.cleanup() between iterations.
+            # Re-establish on next iteration.
+            try:
+                GPIO.setup(L_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+                GPIO.setup(R_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+
+threading.Thread(target=_lr_pager_loop, daemon=True, name="lr-pager").start()
+
+
+# ── 3e. UI click sounds — emit button-event file for mirror to read ──────────
+# The runner can't easily play audio (sudo+root → no pipewire session), but
+# the mirror has the user's Wayland/pipewire session and can. We just write
+# a 1-byte type code to /dev/shm/ktox_btn_evt each time a button registers;
+# mirror polls the mtime and plays the corresponding click sound.
+BTN_EVT_PATH = "/dev/shm/ktox_btn_evt"
+BTN_TYPE = {
+    "KEY_UP_PIN":     b"n",
+    "KEY_DOWN_PIN":   b"n",
+    "KEY_LEFT_PIN":   b"n",
+    "KEY_RIGHT_PIN":  b"n",
+    "KEY_PRESS_PIN":  b"c",   # confirm
+    "KEY1_PIN":       b"b",   # back
+    "KEY2_PIN":       b"h",   # home
+    "KEY3_PIN":       b"x",   # stop/exit
+}
+
+_orig_getButton = ktox_device.getButton
+
+
+def _getButton_with_evt(timeout=120):
+    btn = _orig_getButton(timeout)
+    if btn:
+        code = BTN_TYPE.get(btn, b"n")
+        try:
+            with open(BTN_EVT_PATH, "wb") as f:
+                f.write(code)
+        except Exception:
+            pass
+    return btn
+
+
+ktox_device.getButton = _getButton_with_evt
+
 # ── Run boot() as if we owned the device ─────────────────────────────────────
 import signal  # noqa: E402
 
