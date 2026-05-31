@@ -243,6 +243,202 @@ if [[ -f /etc/xdg/labwc/autostart ]]; then
     info "labwc swaybg autostart now uses KTOX splash"
 fi
 
+# ── BigScreen payload-display shim ────────────────────────────────────────────
+# Replace upstream LCD_1in44.py + LCD_Config.py with shims that route every
+# payload's PIL frames to /dev/shm/ktox_last.jpg (instead of trying to push
+# pixels over SPI to a HAT that doesn't exist). Without this, payloads run
+# silently with no on-panel UI. There are TWO copies of these files (root + a
+# duplicate in ktox_pi/) — both must be replaced because sitecustomize.py
+# inserts ktox_pi at sys.path[0] so it wins.
+step "Installing payload LCD shims..."
+for target in "$KTOX_DIR/LCD_1in44.py" "$KTOX_DIR/ktox_pi/LCD_1in44.py" \
+              "$KTOX_DIR/LCD_Config.py" "$KTOX_DIR/ktox_pi/LCD_Config.py"; do
+    [[ -f "$target" && ! -f "$target.upstream" ]] && cp "$target" "$target.upstream"
+done
+
+cat > "$KTOX_DIR/LCD_1in44.py" << 'PYSHIM'
+"""Drop-in fake for LCD_1in44 — BigScreen Edition. Routes payload frames to
+/dev/shm/ktox_last.jpg for the pygame HDMI compositor; mimics the upstream
+SPI driver's public interface so payloads import + use it unchanged."""
+import os
+from PIL import Image
+SCAN_DIR_DFT = 0
+LCD_1IN44 = 1
+LCD_1IN8 = 0
+LCD_X = 2
+LCD_Y = 1
+LCD_WIDTH = 128
+LCD_HEIGHT = 128
+LCD_X_MAXPIXEL = 132
+LCD_Y_MAXPIXEL = 162
+
+_FRAME_PATH = os.environ.get("KTOX_FRAME_PATH", "/dev/shm/ktox_last.jpg")
+_CANVAS_W = int(os.environ.get("KTOX_CANVAS_W", "320"))
+_CANVAS_H = int(os.environ.get("KTOX_CANVAS_H", "320"))
+
+
+def set_screen_rotation(degrees):
+    pass
+
+
+class LCD:
+    SCAN_DIR_DFT = 0
+
+    def __init__(self):
+        self.width = 128
+        self.height = 128
+
+    def LCD_Init(self, scan_dir=0):
+        try:
+            Image.new("RGB", (_CANVAS_W, _CANVAS_H), "#000000").save(
+                _FRAME_PATH, "JPEG", quality=85)
+        except Exception:
+            pass
+
+    def LCD_ShowImage(self, image, x=0, y=0):
+        try:
+            if image.size != (_CANVAS_W, _CANVAS_H):
+                image = image.resize((_CANVAS_W, _CANVAS_H), Image.NEAREST)
+            tmp = _FRAME_PATH + ".tmp"
+            image.save(tmp, "JPEG", quality=88)
+            os.replace(tmp, _FRAME_PATH)
+        except Exception:
+            pass
+
+    def LCD_Clear(self):
+        pass
+
+    def reset(self):
+        pass
+
+    def __getattr__(self, name):
+        return lambda *a, **k: None
+PYSHIM
+
+cat > "$KTOX_DIR/LCD_Config.py" << 'PYSHIM'
+"""Drop-in fake for LCD_Config — BigScreen Edition."""
+import time
+def Driver_Delay_ms(ms):
+    time.sleep(max(0, ms) / 1000.0)
+def Driver_Delay_us(us):
+    time.sleep(max(0, us) / 1_000_000.0)
+SPI = None
+GPIO_RST_PIN = 27
+GPIO_DC_PIN = 25
+GPIO_CS_PIN = 8
+GPIO_BL_PIN = 24
+PYSHIM
+
+# Mirror the same shims into ktox_pi/ subdir
+cp "$KTOX_DIR/LCD_1in44.py" "$KTOX_DIR/ktox_pi/LCD_1in44.py"
+cp "$KTOX_DIR/LCD_Config.py" "$KTOX_DIR/ktox_pi/LCD_Config.py"
+chown -R "$KTOX_USER:$KTOX_GROUP" "$KTOX_DIR/LCD_1in44.py" "$KTOX_DIR/LCD_Config.py" \
+    "$KTOX_DIR/ktox_pi/LCD_1in44.py" "$KTOX_DIR/ktox_pi/LCD_Config.py"
+info "LCD shims installed in $KTOX_DIR + $KTOX_DIR/ktox_pi"
+
+# Clear any stale .pyc caches so the new shims are loaded
+find "$KTOX_DIR" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+
+# ── BigScreen sitecustomize patches ───────────────────────────────────────────
+# Append to KTOX's existing sitecustomize.py (which already patches GPIO for
+# WebUI virtual button presses). The added block monkey-patches PIL Image.new
+# + ImageDraw.Draw + ImageFont.truetype to render payloads at 2.5x natively
+# on a 320x320 canvas — sharp text instead of NEAREST-upscaled blur. Gated by
+# KTOX_PAYLOAD=1 so it only affects payload subprocesses (the main runner has
+# its own equivalent patches and bypasses this).
+if [[ -f "$KTOX_DIR/sitecustomize.py" ]] && ! grep -q "_BSScaledDraw" "$KTOX_DIR/sitecustomize.py"; then
+    step "Appending BigScreen render patches to sitecustomize.py..."
+    cat >> "$KTOX_DIR/sitecustomize.py" << 'PYAPPEND'
+
+# ────────────────────────────────────────────────────────────────────────────
+# BigScreen Edition: render payloads at 2.5x native (320x320) so they look
+# sharp on the 480x320 panel instead of NEAREST-upscaled from 128x128.
+# Gated by KTOX_PAYLOAD=1 — only payload subprocesses (the runner has its own).
+# ────────────────────────────────────────────────────────────────────────────
+if os.environ.get("KTOX_PAYLOAD") == "1":
+    try:
+        import PIL.Image as _PILImage
+        import PIL.ImageDraw as _PILImageDraw
+        import PIL.ImageFont as _PILImageFont
+        _SCALE = 2.5
+        _BASE = 128
+        _orig_new = _PILImage.new
+        def _scaled_new(mode, size, color=0):
+            if size == (_BASE, _BASE):
+                size = (int(_BASE * _SCALE), int(_BASE * _SCALE))
+            return _orig_new(mode, size, color)
+        _PILImage.new = _scaled_new
+        _orig_truetype = _PILImageFont.truetype
+        def _scaled_truetype(font, size=10, *a, **kw):
+            return _orig_truetype(font, max(1, int(size * _SCALE)), *a, **kw)
+        _PILImageFont.truetype = _scaled_truetype
+        _orig_Draw = _PILImageDraw.Draw
+        def _scale_pts(xy):
+            if not xy: return xy
+            if isinstance(xy, (list, tuple)):
+                if isinstance(xy[0], (list, tuple)):
+                    return type(xy)((int(p[0]*_SCALE), int(p[1]*_SCALE)) for p in xy)
+                return type(xy)(int(c*_SCALE) for c in xy)
+            return xy
+        def _scale_w(kw):
+            if "width" in kw and isinstance(kw["width"], (int, float)):
+                kw = dict(kw); kw["width"] = max(1, int(kw["width"]*_SCALE))
+            return kw
+        class _BSScaledDraw:
+            __slots__ = ("_d",)
+            def __init__(self, im, *a, **kw): self._d = _orig_Draw(im, *a, **kw)
+            def rectangle(self, xy, *a, **kw): return self._d.rectangle(_scale_pts(xy), *a, **_scale_w(kw))
+            def rounded_rectangle(self, xy, *a, radius=0, **kw):
+                return self._d.rounded_rectangle(_scale_pts(xy), *a,
+                    radius=int(radius*_SCALE) if isinstance(radius,(int,float)) else radius,
+                    **_scale_w(kw))
+            def line(self, xy, *a, **kw): return self._d.line(_scale_pts(xy), *a, **_scale_w(kw))
+            def ellipse(self, xy, *a, **kw): return self._d.ellipse(_scale_pts(xy), *a, **_scale_w(kw))
+            def arc(self, xy, *a, **kw): return self._d.arc(_scale_pts(xy), *a, **_scale_w(kw))
+            def chord(self, xy, *a, **kw): return self._d.chord(_scale_pts(xy), *a, **_scale_w(kw))
+            def pieslice(self, xy, *a, **kw): return self._d.pieslice(_scale_pts(xy), *a, **_scale_w(kw))
+            def polygon(self, xy, *a, **kw): return self._d.polygon(_scale_pts(xy), *a, **kw)
+            def point(self, xy, *a, **kw): return self._d.point(_scale_pts(xy), *a, **kw)
+            def text(self, xy, text, *a, **kw):
+                return self._d.text((int(xy[0]*_SCALE), int(xy[1]*_SCALE)), text, *a, **kw)
+            def multiline_text(self, xy, text, *a, **kw):
+                return self._d.multiline_text((int(xy[0]*_SCALE), int(xy[1]*_SCALE)), text, *a, **kw)
+            def textbbox(self, xy, text, *a, **kw):
+                bbox = self._d.textbbox((int(xy[0]*_SCALE), int(xy[1]*_SCALE)), text, *a, **kw)
+                return tuple(int(c/_SCALE) for c in bbox)
+            def textlength(self, text, *a, **kw):
+                return int(self._d.textlength(text, *a, **kw) / _SCALE)
+            def __getattr__(self, name): return getattr(self._d, name)
+        _PILImageDraw.Draw = _BSScaledDraw
+    except Exception:
+        pass
+PYAPPEND
+    info "BigScreen render patches appended to sitecustomize.py"
+fi
+
+# ── Game HAT pin map in gui_conf.json ─────────────────────────────────────────
+if [[ -f "$KTOX_DIR/gui_conf.json" ]]; then
+    step "Setting Game HAT pin map in gui_conf.json..."
+    sudo -u "$KTOX_USER" python3 - "$KTOX_DIR/gui_conf.json" << 'PYJSON'
+import json, sys
+p = sys.argv[1]
+c = json.load(open(p))
+c["PINS"] = {
+    "KEY_UP_PIN": 5, "KEY_DOWN_PIN": 6,
+    "KEY_LEFT_PIN": 13, "KEY_RIGHT_PIN": 19,
+    "KEY_PRESS_PIN": 26, "KEY1_PIN": 12,
+    "KEY2_PIN": 21, "KEY3_PIN": 4,
+}
+json.dump(c, open(p, "w"), indent=2)
+PYJSON
+    info "gui_conf.json PINS set to Game HAT layout"
+fi
+
+# ── Extra payload deps not in the main apt block ──────────────────────────────
+step "Installing extra payload dependencies (bridge-utils, isc-dhcp-client, macchanger, ldap-utils + pip: bottle wifi hashid)..."
+apt-get install -y --no-install-recommends bridge-utils isc-dhcp-client macchanger ldap-utils 2>&1 | tail -2
+pip3 install --break-system-packages --ignore-installed bottle wifi hashid 2>&1 | tail -2 || warn "pip extras had warnings"
+
 # ── WebUI tokens ──────────────────────────────────────────────────────────────
 step "Generating WebUI credentials..."
 for f in "$KTOX_DIR/.webui_token" "$KTOX_DIR/.webui_session_secret"; do
